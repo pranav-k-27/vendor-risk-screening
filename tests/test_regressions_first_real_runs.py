@@ -204,7 +204,7 @@ def test_guardrail_rejects_paraphrased_passage_then_accepts_on_third_call(snapsh
                                  "high", "SEBI penalty on Acme Infotech")
     out = SimpleNamespace(pydantic=FindingsBatch(findings=[paraphrased]), raw="")
     guard = make_findings_guardrail({"vendor_name": "Acme Infotech Ltd", "resolved_name": "ACME INFOTECH LIMITED",
-                                     "aliases": "Acme Infotech"})
+                                     "aliases": "Acme Infotech"}, max_retries=2)
     ok, msg = guard(out)
     assert ok is False
     assert "finding 0 'SEBI penalty on Acme Infotech'" in msg and "supporting_passage not found" in msg
@@ -342,3 +342,124 @@ def test_extract_date_returns_first_in_reading_order_not_earliest():
     text = "Order dated 26 February 2026 concerning trades made on 2019-01-05 and 03/07/2018."
     assert extract_date(text) == "2026-02-26"
     assert extract_date("Hearing on Mar 3, 2025; order of 1 January 2024.") == "2025-03-03"
+
+
+# ---------------------------------------------------------------------------
+# Eval: source-based matching, rescore, counts; configurable guardrail
+# ---------------------------------------------------------------------------
+def test_labelled_finding_matches_by_source_url_or_keywords():
+    from eval.run_eval import finding_matches
+    from tests.test_risk_engine import vf
+
+    f = vf(1)
+    f.source_url = "https://www.sebi.gov.in/enforcement/orders/apr-2021/order_49818.html"
+    by_source = {"dimension": "regulatory", "source_contains": "49818", "match_keywords": ["not in text"]}
+    assert finding_matches(by_source, f)
+    assert not finding_matches(by_source | {"source_contains": "99999"}, f)  # keywords fallback fails too
+    assert not finding_matches(by_source | {"dimension": "adverse_media"}, f)  # dimension must be equal
+    assert finding_matches({"dimension": "regulatory", "source_contains": "99999", "match_keywords": ["t1"]}, f)
+    assert finding_matches({"dimension": "regulatory", "match_keywords": ["t1"]}, f)  # unchanged behaviour
+
+
+def test_rows_and_aggregate_report_counts(isolated_data_dir):
+    from eval.run_eval import aggregate, score_case
+    from tests.test_flow import CrewAIOrchestrator, Runners, empty_runner, media_runner, services
+    from core.schemas import VendorInput
+    from core.sources import slugify
+
+    svc = services()
+    (isolated_data_dir / "documents" / slugify("Acme Infotech Ltd")).mkdir()
+    r = CrewAIOrchestrator(svc=svc, runners=Runners(empty_runner, media_runner(svc.snapshots), None)).assess_vendor(
+        VendorInput(name="Acme Infotech Ltd"))
+    case = {"case_id": "T1", "category": "media_allegation", "vendor": {"name": "Acme Infotech Ltd"},
+            "expected": {"sanctions": "clear", "findings": [
+                {"dimension": "adverse_media", "match_keywords": ["unpaid wages"]},
+                {"dimension": "regulatory", "match_keywords": ["penalty"]}]}}
+    row = score_case(case, r, events=[])
+    assert row["claims_total"] == row["verified"] + row["rejected"] >= 1
+    agg = aggregate([row, row | {"case_id": "T2", "tokens": 5}])
+    assert agg["cases"] == 2 and agg["labelled_findings"] == 4 and agg["matched_findings"] == 2
+    assert agg["claims_total"] == 2 * row["claims_total"] and agg["claims_rejected"] == 2 * row["rejected"]
+    assert agg["total_tokens"] == row["tokens"] + 5
+
+
+def test_rescore_uses_current_gold_without_llm_calls(isolated_data_dir, tmp_path):
+    import json
+
+    from eval.run_eval import rescore
+    from tests.test_flow import CrewAIOrchestrator, Runners, empty_runner, media_runner, services
+    from core.schemas import VendorInput
+    from core.sources import slugify
+
+    svc = services()
+    (isolated_data_dir / "documents" / slugify("Acme Infotech Ltd")).mkdir()
+    r = CrewAIOrchestrator(svc=svc, runners=Runners(empty_runner, media_runner(svc.snapshots), None)).assess_vendor(
+        VendorInput(name="Acme Infotech Ltd"))
+    case = {"case_id": "T1", "category": "media_allegation", "vendor": {"name": "Acme Infotech Ltd"},
+            "expected": {"sanctions": "clear", "findings": [
+                {"dimension": "adverse_media", "match_keywords": ["a keyword nobody wrote"]}]}}
+    old_row = {"case_id": "T1", "category": "media_allegation", "run_id": r.run_id, "repeat": 0,
+               "verified": 9, "rejected": 9, "expected_findings": 1, "matched_findings": 0, "score": 1.0,
+               "wrong_entity": False, "entity_ok": None, "sanctions_ok": None, "band_ok": None,
+               "tokens": 0, "seconds": 0}
+    lost = {"case_id": "T9", "category": "x", "error": "boom", "verified": 0, "rejected": 0,
+            "expected_findings": 1, "matched_findings": 0, "score": None, "wrong_entity": False,
+            "entity_ok": None, "sanctions_ok": None, "band_ok": None, "tokens": 0, "seconds": 0}
+    results = tmp_path / "20260101-000000.json"
+    results.write_text(json.dumps({"multi": {"aggregate": {}, "rows": [old_row, lost]}}), encoding="utf-8")
+
+    # relabel: match the media finding by its source instead of the keyword
+    src = r.findings[0].source_url
+    case["expected"]["findings"][0]["source_contains"] = src.split("//")[-1]
+    gold = tmp_path / "gold.json"
+    gold.write_text(json.dumps({"cases": [case]}), encoding="utf-8")
+
+    out = rescore(results, gold)
+    assert out.name == "20260101-000000.rescored.json" and out.with_suffix(".md").exists()
+    data = json.loads(out.read_text(encoding="utf-8"))["multi"]
+    new_row, kept = data["rows"]
+    assert new_row["matched_findings"] == 1 and new_row["verified"] == len(r.findings)
+    assert new_row["repeat"] == 0 and new_row["run_id"] == r.run_id and "guardrail_retries" in new_row
+    assert kept["rescore_note"].startswith("no run_id") and kept["claims_total"] == 0
+    assert data["aggregate"]["matched_findings"] == 1 and data["aggregate"]["labelled_findings"] == 2
+
+
+def test_guardrail_max_retries_from_env(monkeypatch, snapshots):
+    from types import SimpleNamespace
+
+    from core.schemas import FindingsBatch
+    from orchestration.crewai_impl.agents import guardrail_max_retries, make_findings_guardrail
+
+    monkeypatch.delenv("GUARDRAIL_MAX_RETRIES", raising=False)
+    assert guardrail_max_retries() == 1
+    monkeypatch.setenv("GUARDRAIL_MAX_RETRIES", "not a number")
+    assert guardrail_max_retries() == 1
+
+    sid = snapshots.save(ORDER.encode(), ORDER_URL, "regulatory_document", suffix=".txt").snapshot_id
+    bad = SimpleNamespace(pydantic=FindingsBatch(findings=[_order_finding(
+        sid, "SEBI fined the company twenty five crore rupees for selling bonds badly", "high", "x")]), raw="")
+    inputs = {"vendor_name": "Acme Infotech Ltd", "resolved_name": "ACME INFOTECH LIMITED"}
+
+    monkeypatch.delenv("GUARDRAIL_MAX_RETRIES")
+    g = make_findings_guardrail(inputs)  # default 1: reject once, accept on the 2nd call
+    assert g(bad)[0] is False and g(bad)[0] is True
+
+    monkeypatch.setenv("GUARDRAIL_MAX_RETRIES", "0")
+    assert make_findings_guardrail(inputs)(bad)[0] is True  # no retries: accepted immediately
+
+
+def test_noguard_guardrail_skips_validator_but_keeps_structural_checks(snapshots):
+    from types import SimpleNamespace
+
+    from core.audit import AuditLogger
+    from core.schemas import FindingsBatch
+    from orchestration.crewai_impl.agents import make_findings_guardrail
+
+    sid = snapshots.save(ORDER.encode(), ORDER_URL, "regulatory_document", suffix=".txt").snapshot_id
+    para = _order_finding(sid, "SEBI fined the company twenty five crore rupees for selling bonds badly", "high", "x")
+    g = make_findings_guardrail({"run_id": "RUN-NG", "vendor_name": "Acme Infotech Ltd"}, max_retries=2,
+                                validate=False)
+    assert g(SimpleNamespace(pydantic=FindingsBatch(findings=[para]), raw=""))[0] is True  # not validated
+    short = para.model_copy(update={"supporting_passage": "too short"})
+    assert g(SimpleNamespace(pydantic=FindingsBatch(findings=[short]), raw=""))[0] is False  # structure still checked
+    assert [e["payload"]["accepted"] for e in AuditLogger().events("RUN-NG")] == [True, False]

@@ -38,6 +38,20 @@ def _text(f) -> str:
     return " ".join([f.title, f.summary, f.supporting_passage]).lower()
 
 
+def finding_matches(lf: dict, f) -> bool:
+    """A verified finding matches a labelled one if the dimension is equal AND
+    (all match_keywords appear in title+summary+passage OR source_contains is in its source_url)."""
+    if f.dimension.value != lf["dimension"]:
+        return False
+    src = str(lf.get("source_contains") or "").strip().lower()
+    if src and src in f.source_url.lower():
+        return True
+    kws = [k.lower() for k in lf.get("match_keywords", [])]
+    if not kws:
+        return not src  # no keywords: only a source_contains label can match, and it did not
+    return all(k in _text(f) for k in kws)
+
+
 def guardrail_stats(events: list[dict], r: AssessmentReport) -> dict:
     """From a run's audit events: how often the guardrail sent agents back, and how many
     findings that failed an earlier check ended up verified (matched by title)."""
@@ -62,6 +76,7 @@ def score_case(case: dict, r: AssessmentReport, events: list[dict] | None = None
     out["seconds"] = r.metrics.duration_s
     out["verified"] = len(r.findings)
     out["rejected"] = len(r.rejected_findings)
+    out["claims_total"] = out["verified"] + out["rejected"]
     if events is None:
         from core.audit import AuditLogger
 
@@ -69,11 +84,7 @@ def score_case(case: dict, r: AssessmentReport, events: list[dict] | None = None
     out |= guardrail_stats(events, r)
 
     labelled = exp.get("findings", [])
-    matched = []
-    for lf in labelled:
-        kws = [k.lower() for k in lf.get("match_keywords", [])]
-        hit = any(f.dimension.value == lf["dimension"] and all(k in _text(f) for k in kws) for f in r.findings)
-        matched.append(hit)
+    matched = [any(finding_matches(lf, f) for f in r.findings) for lf in labelled]
     out["expected_findings"] = len(labelled)
     out["matched_findings"] = sum(matched)
 
@@ -102,6 +113,7 @@ def build(config: str):
         "multi": lambda: CrewAIOrchestrator(validate=True),
         "single": lambda: SingleAgentOrchestrator(validate=True),
         "multi-novalidate": lambda: CrewAIOrchestrator(validate=False),
+        "multi-noguard": lambda: CrewAIOrchestrator(validate=True, guard_validate=False),  # no validator in the agent loop
         "single-novalidate": lambda: SingleAgentOrchestrator(validate=False),
     }[config]()
 
@@ -121,6 +133,12 @@ def aggregate(rows: list[dict]) -> dict:
     stds = [statistics.pstdev(v) for v in by_case.values() if len(v) > 1]
     return {
         "runs": len(rows),
+        "cases": len({r.get("case_id") for r in rows}),
+        "labelled_findings": exp,
+        "matched_findings": sum(r["matched_findings"] for r in rows),
+        "claims_total": claims,
+        "claims_rejected": sum(r["rejected"] for r in rows),
+        "total_tokens": sum(r.get("tokens") or 0 for r in rows),
         "finding_recall": round(sum(r["matched_findings"] for r in rows) / exp, 3) if exp else None,
         "wrong_entity_rate": _mean([1.0 if r["wrong_entity"] else 0.0 for r in rows]),
         "unsupported_rate": round(sum(r["rejected"] for r in rows) / claims, 3) if claims else None,
@@ -136,6 +154,71 @@ def aggregate(rows: list[dict]) -> dict:
     }
 
 
+def load_cases(gold_path: str | Path) -> list[dict]:
+    gold = json.loads(Path(gold_path).read_text(encoding="utf-8"))
+    all_cases = gold if isinstance(gold, list) else gold["cases"]  # accept a bare list too
+    return [c for c in all_cases if not c["vendor"]["name"].startswith("TODO")]
+
+
+def error_row(case: dict, error: str) -> dict:
+    return {"case_id": case["case_id"], "category": case["category"], "error": error[:300],
+            "score": None, "verified": 0, "rejected": 0, "claims_total": 0,
+            "expected_findings": len(case["expected"].get("findings", [])),
+            "matched_findings": 0, "wrong_entity": False, "sanctions_ok": None, "entity_ok": None,
+            "band_ok": None, "tokens": 0, "seconds": 0}
+
+
+def write_summary(summary: dict, out: Path) -> Path:
+    """Write <out>.json and <out>.md (metric table, one column per config); returns the .md path."""
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(summary, indent=2, default=str), encoding="utf-8")
+    keys = list(next(iter(summary.values()))["aggregate"].keys()) if summary else []
+    md = ["| metric | " + " | ".join(summary) + " |", "|---|" + "---|" * len(summary)]
+    md += [f"| {k} | " + " | ".join(str(summary[c]["aggregate"].get(k)) for c in summary) + " |" for k in keys]
+    md_path = out.with_suffix(".md")
+    md_path.write_text("\n".join(md) + "\n", encoding="utf-8")
+    print("\n" + "\n".join(md))
+    print(f"\nSaved {out} and {md_path}")
+    return md_path
+
+
+def rescore(results_path: str | Path, gold_path: str | Path, runs_root: Path | None = None) -> Path:
+    """Re-score saved runs against the CURRENT gold standard. No LLM calls.
+
+    For every row with a run_id, loads data/runs/<run_id>/report.json and recomputes the row
+    (guardrail fields come from the audit log). Rows without a run_id, or whose report or case is
+    missing, are kept as they were with a 'rescore_note'. Writes <name>.rescored.json and .md.
+    """
+    from core.reporting import load_report
+
+    results_path = Path(results_path)
+    old = json.loads(results_path.read_text(encoding="utf-8"))
+    cases = {c["case_id"]: c for c in load_cases(gold_path)}
+    summary = {}
+    for cfg, block in old.items():
+        rows = []
+        for row in block.get("rows", []):
+            run_id, case = row.get("run_id"), cases.get(row.get("case_id"))
+            if not run_id:
+                rows.append(row | {"rescore_note": "no run_id; kept as is"})
+                continue
+            if case is None:
+                rows.append(row | {"rescore_note": "case not in current gold standard; kept as is"})
+                continue
+            try:
+                report = load_report(run_id, runs_root)
+            except FileNotFoundError:
+                rows.append(row | {"rescore_note": f"report for {run_id} not found; kept as is"})
+                continue
+            extra = {k: row[k] for k in ("repeat",) if k in row}
+            rows.append(score_case(case, report) | extra | {"run_id": run_id})
+        rows = [{"claims_total": r.get("verified", 0) + r.get("rejected", 0)} | r for r in rows]
+        summary[cfg] = {"aggregate": aggregate(rows), "rows": rows}
+    out = results_path.with_name(results_path.stem + ".rescored.json")
+    write_summary(summary, out)
+    return out
+
+
 def main() -> None:
     load_dotenv()
     ap = argparse.ArgumentParser()
@@ -143,11 +226,15 @@ def main() -> None:
     ap.add_argument("--configs", default="multi")
     ap.add_argument("--repeats", type=int, default=1)
     ap.add_argument("--cases", default="", help="comma-separated case_ids (default: all labelled)")
+    ap.add_argument("--rescore", metavar="RESULTS_JSON",
+                    help="re-score a saved results file against the current gold standard (no LLM calls)")
     args = ap.parse_args()
 
-    gold = json.loads(Path(args.gold).read_text(encoding="utf-8"))
-    all_cases = gold if isinstance(gold, list) else gold["cases"]  # accept a bare list too
-    cases = [c for c in all_cases if not c["vendor"]["name"].startswith("TODO")]
+    if args.rescore:
+        rescore(args.rescore, args.gold)
+        return
+
+    cases = load_cases(args.gold)
     if args.cases:
         wanted = set(args.cases.split(","))
         cases = [c for c in cases if c["case_id"] in wanted]
@@ -167,25 +254,13 @@ def main() -> None:
                         print(f"  {case['case_id']}: needs entity confirmation; add 'lei' or 'confirmed': true to the case")
                     row = score_case(case, r) | {"repeat": rep, "run_id": r.run_id}
                 except Exception as exc:
-                    row = {"case_id": case["case_id"], "category": case["category"], "error": str(exc)[:300],
-                           "score": None, "verified": 0, "rejected": 0, "expected_findings": len(case["expected"].get("findings", [])),
-                           "matched_findings": 0, "wrong_entity": False, "sanctions_ok": None, "entity_ok": None,
-                           "band_ok": None, "tokens": 0, "seconds": 0}
+                    row = error_row(case, str(exc))
                 rows.append(row)
                 print(f"  [{cfg}] {case['case_id']} rep{rep}: band={row.get('band')} score={row.get('score')} "
                       f"matched={row['matched_findings']}/{row['expected_findings']} rejected={row['rejected']}")
         summary[cfg] = {"aggregate": aggregate(rows), "rows": rows}
 
-    out = HERE / "results" / f"{stamp}.json"
-    out.parent.mkdir(exist_ok=True)
-    out.write_text(json.dumps(summary, indent=2, default=str), encoding="utf-8")
-
-    keys = list(next(iter(summary.values()))["aggregate"].keys())
-    md = ["| metric | " + " | ".join(summary) + " |", "|---|" + "---|" * len(summary)]
-    md += [f"| {k} | " + " | ".join(str(summary[c]["aggregate"][k]) for c in summary) + " |" for k in keys]
-    (out.with_suffix(".md")).write_text("\n".join(md) + "\n", encoding="utf-8")
-    print("\n" + "\n".join(md))
-    print(f"\nSaved {out} and {out.with_suffix('.md')}")
+    write_summary(summary, HERE / "results" / f"{stamp}.json")
 
 
 if __name__ == "__main__":

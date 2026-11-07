@@ -34,11 +34,12 @@ def _explain_runner(llm):
     return run
 
 
-def default_runners(explain: bool = True) -> Runners:
+def default_runners(explain: bool = True, guard_validate: bool = True) -> Runners:
+    """guard_validate=False: task guardrails run structural checks only (no validator feedback loop)."""
     llm = agents.build_llm()
     return Runners(
-        regulatory=_crew_runner(lambda inputs: agents.regulatory_crew(llm, inputs)),
-        media=_crew_runner(lambda inputs: agents.media_crew(llm, inputs)),
+        regulatory=_crew_runner(lambda inputs: agents.regulatory_crew(llm, inputs, guard_validate)),
+        media=_crew_runner(lambda inputs: agents.media_crew(llm, inputs, guard_validate)),
         explain=_explain_runner(llm) if explain else None,
     )
 
@@ -47,9 +48,9 @@ class CrewAIOrchestrator:
     name = "crewai_flow"
 
     def __init__(self, svc: Services | None = None, runners: Runners | None = None, validate: bool = True,
-                 explain: bool = True):
+                 explain: bool = True, guard_validate: bool = True):
         self.svc = svc or Services.default()
-        self.runners = runners or default_runners(explain)
+        self.runners = runners or default_runners(explain, guard_validate)
         self.validate = validate
         self.model = os.getenv("MODEL", "gpt-4o-mini")
 

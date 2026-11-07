@@ -51,18 +51,29 @@ def _structural_problem(batch) -> str | None:
 # Validator failures the agent can fix by re-reading the source. Others (entity not mentioned, hash
 # mismatch) are left to the final validator in pipeline.finalize.
 _RETRYABLE = ("supporting_passage not found", "source_url does not match", "snapshot_id not found")
-GUARDRAIL_MAX_RETRIES = 2
+DEFAULT_GUARDRAIL_MAX_RETRIES = 1
 
 
-def make_findings_guardrail(inputs: dict | None = None, max_retries: int = GUARDRAIL_MAX_RETRIES,
-                            agent: str = "research", audit: AuditLogger | None = None):
-    """Task guardrail: structural checks, then the real evidence validator, with feedback to the agent.
+def guardrail_max_retries() -> int:
+    """Env GUARDRAIL_MAX_RETRIES (default 1). Read at crew-build time so an eval can change it per run."""
+    try:
+        return max(0, int(os.getenv("GUARDRAIL_MAX_RETRIES", DEFAULT_GUARDRAIL_MAX_RETRIES)))
+    except ValueError:
+        return DEFAULT_GUARDRAIL_MAX_RETRIES
 
-    After max_retries rejections the batch is accepted as is, so the task never errors out;
-    pipeline.finalize still rejects any claim that fails validation.
+
+def make_findings_guardrail(inputs: dict | None = None, max_retries: int | None = None,
+                            agent: str = "research", audit: AuditLogger | None = None, validate: bool = True):
+    """Task guardrail: structural checks, then (if validate) the real evidence validator, with feedback.
+
+    After max_retries rejections (default: guardrail_max_retries()) the batch is accepted as is, so the
+    task never errors out; pipeline.finalize still rejects any claim that fails validation.
+    validate=False runs the structural checks only (the "multi-noguard" ablation).
     Every call is written to the audit log as "guardrail_check" when inputs carry a run_id.
     """
     inputs = inputs or {}
+    if max_retries is None:
+        max_retries = guardrail_max_retries()
     run_id = inputs.get("run_id")
     aliases = [a.strip() for a in str(inputs.get("aliases", "")).split(",") if a.strip() and a.strip() != "none"]
     vendor_name = inputs.get("vendor_name") or inputs.get("resolved_name") or "unknown"
@@ -94,9 +105,9 @@ def make_findings_guardrail(inputs: dict | None = None, max_retries: int = GUARD
             if last_chance:
                 return True, batch if isinstance(batch, FindingsBatch) else output.raw
             return False, problem
-        validator = EvidenceValidator()
         failing: list[dict] = []
-        for i, f in enumerate(batch.findings):
+        validator = EvidenceValidator() if validate else None
+        for i, f in enumerate(batch.findings if validator else []):
             reasons = [r for r in validator.validate_one(f, "guardrail", entity).rejection_reasons
                        if r.startswith(_RETRYABLE)]
             if reasons:
@@ -114,7 +125,7 @@ def make_findings_guardrail(inputs: dict | None = None, max_retries: int = GUARD
 
 
 # ---------------------------------------------------------------------------
-def regulatory_crew(llm: LLM, inputs: dict | None = None) -> Crew:
+def regulatory_crew(llm: LLM, inputs: dict | None = None, guard_validate: bool = True) -> Crew:
     agent = Agent(
         role="Regulatory Intelligence Analyst",
         goal="Extract and correctly classify regulatory actions against the vendor from curated official documents.",
@@ -138,12 +149,13 @@ def regulatory_crew(llm: LLM, inputs: dict | None = None) -> Crew:
             + EVIDENCE_RULES
         ),
         expected_output="A FindingsBatch JSON object.",
-        agent=agent, output_pydantic=FindingsBatch, guardrail=make_findings_guardrail(inputs, agent="regulatory"), guardrail_max_retries=GUARDRAIL_MAX_RETRIES,
+        agent=agent, output_pydantic=FindingsBatch, guardrail=make_findings_guardrail(inputs, agent="regulatory", validate=guard_validate),
+        guardrail_max_retries=guardrail_max_retries(),
     )
     return Crew(agents=[agent], tasks=[task], process=Process.sequential, verbose=False)
 
 
-def media_crew(llm: LLM, inputs: dict | None = None) -> Crew:
+def media_crew(llm: LLM, inputs: dict | None = None, guard_validate: bool = True) -> Crew:
     agent = Agent(
         role="Adverse Media Intelligence Analyst",
         goal="Find credible adverse media about the vendor and separate allegations from confirmed actions.",
@@ -164,7 +176,8 @@ def media_crew(llm: LLM, inputs: dict | None = None) -> Crew:
             + EVIDENCE_RULES
         ),
         expected_output="A FindingsBatch JSON object.",
-        agent=agent, output_pydantic=FindingsBatch, guardrail=make_findings_guardrail(inputs, agent="adverse_media"), guardrail_max_retries=GUARDRAIL_MAX_RETRIES,
+        agent=agent, output_pydantic=FindingsBatch, guardrail=make_findings_guardrail(inputs, agent="adverse_media", validate=guard_validate),
+        guardrail_max_retries=guardrail_max_retries(),
     )
     return Crew(agents=[agent], tasks=[task], process=Process.sequential, verbose=False)
 
@@ -196,7 +209,7 @@ def explainer_crew(llm: LLM) -> Crew:
     return Crew(agents=[agent], tasks=[task], process=Process.sequential, verbose=False)
 
 
-def single_agent_crew(llm: LLM, inputs: dict | None = None) -> Crew:
+def single_agent_crew(llm: LLM, inputs: dict | None = None, guard_validate: bool = True) -> Crew:
     """Baseline: ONE agent with every tool does both regulatory and media research."""
     agent = Agent(
         role="Vendor Due Diligence Analyst",
@@ -213,6 +226,7 @@ def single_agent_crew(llm: LLM, inputs: dict | None = None) -> Crew:
             + EVIDENCE_RULES
         ),
         expected_output="A FindingsBatch JSON object.",
-        agent=agent, output_pydantic=FindingsBatch, guardrail=make_findings_guardrail(inputs, agent="single_agent"), guardrail_max_retries=GUARDRAIL_MAX_RETRIES,
+        agent=agent, output_pydantic=FindingsBatch, guardrail=make_findings_guardrail(inputs, agent="single_agent", validate=guard_validate),
+        guardrail_max_retries=guardrail_max_retries(),
     )
     return Crew(agents=[agent], tasks=[task], process=Process.sequential, verbose=False)
