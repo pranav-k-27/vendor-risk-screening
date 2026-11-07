@@ -57,3 +57,8 @@ matching:
     entity_min_score: 85
     min_passage_chars: 20
     max_passage_chars: 600
+    # official_finding / settlement / under_appeal need a regulator source:
+    # a curated regulatory_document snapshot, or a URL on one of these hosts (or a subdomain)
+    regulator_domains: [sebi.gov.in, rbi.org.in, nclt.gov.in, mca.gov.in, cci.gov.in, irdai.gov.in, nse-india.com, nseindia.com, bseindia.com]
+    # a media_confirmed passage containing any of these is downgraded to media_allegation
+    hedge_words: [alleged, allegedly, reportedly, purportedly, accused, probe, investigating, under investigation]
