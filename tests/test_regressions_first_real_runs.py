@@ -276,3 +276,69 @@ def test_event_date_extracted_from_source_text(snapshots, entity):
     )
     v = EvidenceValidator(snapshots).validate_one(f, "adverse_media", entity)
     assert v.event_date == "2026-03-03" and "event_date extracted from source text" in v.warnings
+
+
+# ---------------------------------------------------------------------------
+# Guardrail audit trail; first-date extraction
+# ---------------------------------------------------------------------------
+def test_guardrail_logs_every_check_to_audit(snapshots):
+    from types import SimpleNamespace
+
+    from core.audit import AuditLogger
+    from core.schemas import FindingsBatch
+    from orchestration.crewai_impl.agents import make_findings_guardrail
+
+    sid = snapshots.save(ORDER.encode(), ORDER_URL, "regulatory_document", suffix=".txt").snapshot_id
+    bad = _order_finding(sid, "SEBI fined the company twenty five crore rupees for selling bonds badly",
+                         "high", "Paraphrased penalty")
+    good = _order_finding(sid, "A penalty of Rs. 25 crore is imposed on Acme Infotech Limited", "high", "Penalty")
+    guard = make_findings_guardrail({"run_id": "RUN-G1", "vendor_name": "Acme Infotech Ltd",
+                                     "resolved_name": "ACME INFOTECH LIMITED"}, agent="regulatory")
+    assert guard(SimpleNamespace(pydantic=FindingsBatch(findings=[good, bad]), raw=""))[0] is False
+    assert guard(SimpleNamespace(pydantic=FindingsBatch(findings=[good]), raw=""))[0] is True
+
+    events = [e for e in AuditLogger().events("RUN-G1") if e["event"] == "guardrail_check"]
+    assert [e["payload"]["attempt"] for e in events] == [1, 2]
+    first, second = events[0]["payload"], events[1]["payload"]
+    assert first["agent"] == "regulatory" and first["findings"] == 2 and first["accepted"] is False
+    assert first["failing"] == [{"index": 1, "title": "Paraphrased penalty",
+                                 "reason": first["failing"][0]["reason"]}]
+    assert first["failing"][0]["reason"].startswith("supporting_passage not found")
+    assert second == {"agent": "regulatory", "attempt": 2, "findings": 1, "failing": [], "accepted": True}
+    assert AuditLogger().verify_chain() == (True, None)
+
+
+def test_eval_counts_guardrail_retries_and_fixes():
+    from eval.run_eval import aggregate, guardrail_stats
+    from tests.test_risk_engine import vf
+
+    def check(attempt, accepted, titles):
+        return {"event": "guardrail_check", "payload": {
+            "agent": "regulatory", "attempt": attempt, "findings": len(titles), "accepted": accepted,
+            "failing": [{"index": i, "title": t, "reason": "supporting_passage not found"} for i, t in enumerate(titles)]}}
+
+    events = [check(1, False, ["t1", "gone"]), check(2, False, ["t1"]), check(3, True, []),
+              {"event": "risk_scored", "payload": {}}]
+    report = SimpleReport(findings=[vf(1), vf(2)])  # titles t1, t2
+    stats = guardrail_stats(events, report)
+    assert stats == {"guardrail_retries": 2, "guardrail_fixed": 1}  # t1 fixed; "gone" was removed
+
+    rows = [stats, {"guardrail_retries": 1, "guardrail_fixed": 0}]
+    base = {"expected_findings": 0, "verified": 0, "rejected": 0, "score": None, "matched_findings": 0,
+            "wrong_entity": False, "entity_ok": None, "sanctions_ok": None, "band_ok": None,
+            "tokens": 0, "seconds": 0}
+    agg = aggregate([base | r for r in rows])
+    assert agg["guardrail_retries"] == 3 and agg["guardrail_fixed"] == 1
+
+
+class SimpleReport:
+    def __init__(self, findings):
+        self.findings = findings
+
+
+def test_extract_date_returns_first_in_reading_order_not_earliest():
+    from core.evidence_validator import extract_date
+
+    text = "Order dated 26 February 2026 concerning trades made on 2019-01-05 and 03/07/2018."
+    assert extract_date(text) == "2026-02-26"
+    assert extract_date("Hearing on Mar 3, 2025; order of 1 January 2024.") == "2025-03-03"

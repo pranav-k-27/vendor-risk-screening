@@ -7,6 +7,7 @@ import os
 from crewai import LLM, Agent, Crew, Process, Task
 from crewai.tasks.task_output import TaskOutput
 
+from core.audit import AuditLogger
 from core.config import load_rules
 from core.evidence_validator import EvidenceValidator
 from core.schemas import EntityResolution, EntityStatus, Explanation, FindingsBatch
@@ -53,13 +54,16 @@ _RETRYABLE = ("supporting_passage not found", "source_url does not match", "snap
 GUARDRAIL_MAX_RETRIES = 2
 
 
-def make_findings_guardrail(inputs: dict | None = None, max_retries: int = GUARDRAIL_MAX_RETRIES):
+def make_findings_guardrail(inputs: dict | None = None, max_retries: int = GUARDRAIL_MAX_RETRIES,
+                            agent: str = "research", audit: AuditLogger | None = None):
     """Task guardrail: structural checks, then the real evidence validator, with feedback to the agent.
 
     After max_retries rejections the batch is accepted as is, so the task never errors out;
     pipeline.finalize still rejects any claim that fails validation.
+    Every call is written to the audit log as "guardrail_check" when inputs carry a run_id.
     """
     inputs = inputs or {}
+    run_id = inputs.get("run_id")
     aliases = [a.strip() for a in str(inputs.get("aliases", "")).split(",") if a.strip() and a.strip() != "none"]
     vendor_name = inputs.get("vendor_name") or inputs.get("resolved_name") or "unknown"
     entity = EntityResolution(
@@ -68,29 +72,43 @@ def make_findings_guardrail(inputs: dict | None = None, max_retries: int = GUARD
     )
     state = {"calls": 0}
 
+    def _log(attempt: int, findings: int, failing: list[dict], accepted: bool) -> None:
+        if not run_id:
+            return
+        try:
+            (audit or AuditLogger()).log(run_id, "guardrail_check", {
+                "agent": agent, "attempt": attempt, "findings": findings, "failing": failing, "accepted": accepted,
+            })
+        except Exception:  # observability must never break the agent run
+            pass
+
     def guardrail(output: TaskOutput):  # returns (bool, Any); CrewAI rejects string annotations
         state["calls"] += 1
+        attempt = state["calls"]
         batch = output.pydantic
-        last_chance = state["calls"] > max_retries
+        last_chance = attempt > max_retries
         problem = _structural_problem(batch)
         if problem:
+            n = len(batch.findings) if isinstance(batch, FindingsBatch) else 0
+            _log(attempt, n, [{"index": None, "title": None, "reason": problem}], last_chance)
             if last_chance:
                 return True, batch if isinstance(batch, FindingsBatch) else output.raw
             return False, problem
-        if last_chance:
-            return True, batch
         validator = EvidenceValidator()
-        failures = []
+        failing: list[dict] = []
         for i, f in enumerate(batch.findings):
             reasons = [r for r in validator.validate_one(f, "guardrail", entity).rejection_reasons
                        if r.startswith(_RETRYABLE)]
             if reasons:
-                failures.append(f"- finding {i} '{f.title}': {'; '.join(reasons)}")
-        if failures:
-            return False, ("These findings could not be verified against the stored source:\n" + "\n".join(failures)
-                           + "\nCall read_source again and copy the passage VERBATIM from the text, "
-                             "or remove the finding.")
-        return True, batch
+                failing.append({"index": i, "title": f.title, "reason": "; ".join(reasons)})
+        accepted = not failing or last_chance
+        _log(attempt, len(batch.findings), failing, accepted)
+        if accepted:
+            return True, batch
+        lines = [f"- finding {x['index']} '{x['title']}': {x['reason']}" for x in failing]
+        return False, ("These findings could not be verified against the stored source:\n" + "\n".join(lines)
+                       + "\nCall read_source again and copy the passage VERBATIM from the text, "
+                         "or remove the finding.")
 
     return guardrail
 
@@ -120,7 +138,7 @@ def regulatory_crew(llm: LLM, inputs: dict | None = None) -> Crew:
             + EVIDENCE_RULES
         ),
         expected_output="A FindingsBatch JSON object.",
-        agent=agent, output_pydantic=FindingsBatch, guardrail=make_findings_guardrail(inputs), guardrail_max_retries=GUARDRAIL_MAX_RETRIES,
+        agent=agent, output_pydantic=FindingsBatch, guardrail=make_findings_guardrail(inputs, agent="regulatory"), guardrail_max_retries=GUARDRAIL_MAX_RETRIES,
     )
     return Crew(agents=[agent], tasks=[task], process=Process.sequential, verbose=False)
 
@@ -146,7 +164,7 @@ def media_crew(llm: LLM, inputs: dict | None = None) -> Crew:
             + EVIDENCE_RULES
         ),
         expected_output="A FindingsBatch JSON object.",
-        agent=agent, output_pydantic=FindingsBatch, guardrail=make_findings_guardrail(inputs), guardrail_max_retries=GUARDRAIL_MAX_RETRIES,
+        agent=agent, output_pydantic=FindingsBatch, guardrail=make_findings_guardrail(inputs, agent="adverse_media"), guardrail_max_retries=GUARDRAIL_MAX_RETRIES,
     )
     return Crew(agents=[agent], tasks=[task], process=Process.sequential, verbose=False)
 
@@ -195,6 +213,6 @@ def single_agent_crew(llm: LLM, inputs: dict | None = None) -> Crew:
             + EVIDENCE_RULES
         ),
         expected_output="A FindingsBatch JSON object.",
-        agent=agent, output_pydantic=FindingsBatch, guardrail=make_findings_guardrail(inputs), guardrail_max_retries=GUARDRAIL_MAX_RETRIES,
+        agent=agent, output_pydantic=FindingsBatch, guardrail=make_findings_guardrail(inputs, agent="single_agent"), guardrail_max_retries=GUARDRAIL_MAX_RETRIES,
     )
     return Crew(agents=[agent], tasks=[task], process=Process.sequential, verbose=False)

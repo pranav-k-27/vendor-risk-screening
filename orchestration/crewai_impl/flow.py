@@ -76,6 +76,7 @@ class VendorAssessmentFlow(Flow):
     # ---- 3. research, in parallel -------------------------------------------
     def _inputs(self) -> dict:
         return {
+            "run_id": self.run_id,  # lets the task guardrail write to the audit log
             "vendor_name": self.vendor.name,
             "resolved_name": self.entity.resolved_name,
             "aliases": ", ".join(self.entity.aliases) or "none",

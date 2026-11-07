@@ -92,7 +92,7 @@ class SingleAgentOrchestrator:
             return pipeline.finalize(outcomes=[ResearchOutcome("regulatory", SourceStatus.SKIPPED),
                                                ResearchOutcome("adverse_media", SourceStatus.SKIPPED)], **common)
 
-        inputs = {"vendor_name": vendor.name, "resolved_name": entity.resolved_name,
+        inputs = {"run_id": run_id, "vendor_name": vendor.name, "resolved_name": entity.resolved_name,
                   "aliases": ", ".join(entity.aliases) or "none", "country": vendor.country}
         try:
             batch, usage = asyncio.run(self.research(inputs))

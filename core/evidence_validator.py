@@ -49,22 +49,19 @@ _DATE_PATTERNS = [
 
 
 def extract_date(text: str) -> str | None:
-    """First valid calendar date in the text as YYYY-MM-DD (standard library only).
+    """The FIRST valid calendar date in reading order (not the chronologically earliest), as YYYY-MM-DD.
 
     Formats: 2026-02-26, 26/02/2026, Feb 26, 2026, February 26, 2026, 26 February 2026, 26 Feb 2026.
+    Impossible dates (e.g. 31/02/2026) are skipped. Standard library only.
     """
-    best: tuple[int, str] | None = None
+    found: list[tuple[int, str]] = []
     for rx, parts in _DATE_PATTERNS:
         for m in rx.finditer(text or ""):
-            if best is not None and m.start() >= best[0]:
-                break
             try:
-                iso = date(*parts(m.groups())).isoformat()
+                found.append((m.start(), date(*parts(m.groups())).isoformat()))
             except ValueError:
-                continue  # e.g. 31/02/2026: try the next match
-            best = (m.start(), iso)
-            break
-    return best[1] if best else None
+                continue
+    return min(found)[1] if found else None  # smallest position = first in the text
 
 
 OFFICIAL_EVIDENCE = {EvidenceType.OFFICIAL_FINDING, EvidenceType.SETTLEMENT, EvidenceType.UNDER_APPEAL}
