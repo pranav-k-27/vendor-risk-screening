@@ -19,7 +19,7 @@ from orchestration.crewai_impl.flow import Runners, VendorAssessmentFlow
 
 def _crew_runner(build):
     async def run(inputs: dict) -> tuple[FindingsBatch, dict]:
-        out = await build().kickoff_async(inputs=inputs)
+        out = await build(inputs).kickoff_async(inputs=inputs)  # guardrail needs the run inputs
         batch = out.pydantic if isinstance(out.pydantic, FindingsBatch) else FindingsBatch()
         return batch, pipeline.usage_from(out)
     return run
@@ -37,8 +37,8 @@ def _explain_runner(llm):
 def default_runners(explain: bool = True) -> Runners:
     llm = agents.build_llm()
     return Runners(
-        regulatory=_crew_runner(lambda: agents.regulatory_crew(llm)),
-        media=_crew_runner(lambda: agents.media_crew(llm)),
+        regulatory=_crew_runner(lambda inputs: agents.regulatory_crew(llm, inputs)),
+        media=_crew_runner(lambda inputs: agents.media_crew(llm, inputs)),
         explain=_explain_runner(llm) if explain else None,
     )
 
@@ -72,7 +72,7 @@ class SingleAgentOrchestrator:
         self.svc = svc or Services.default()
         self.validate = validate
         llm = agents.build_llm() if (research is None or (explain and explain_fn is None)) else None
-        self.research = research or _crew_runner(lambda: agents.single_agent_crew(llm))
+        self.research = research or _crew_runner(lambda inputs: agents.single_agent_crew(llm, inputs))
         self.explain = explain_fn or (_explain_runner(llm) if explain else None)
         self.model = os.getenv("MODEL", "gpt-4o-mini")
 

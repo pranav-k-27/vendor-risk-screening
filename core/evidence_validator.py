@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+from datetime import date
 from urllib.parse import urlparse
 
 from rapidfuzz import fuzz
@@ -30,6 +31,40 @@ def _finding_id(agent: str, f: RawFinding) -> str:
 
 def _url_key(url: str) -> str:
     return url.strip().lower().rstrip("/").replace("https://", "").replace("http://", "").replace("www.", "")
+
+
+_MONTHS = {m: i for i, m in enumerate(
+    ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"], start=1)}
+_MON = r"(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|july?|aug(?:ust)?|sept?(?:ember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\.?"
+_ORD = r"(?:st|nd|rd|th)?"
+# each pattern -> function returning (year, month, day) from the match groups
+_DATE_PATTERNS = [
+    (re.compile(r"\b(\d{4})-(\d{1,2})-(\d{1,2})\b"), lambda g: (int(g[0]), int(g[1]), int(g[2]))),
+    (re.compile(r"\b(\d{1,2})/(\d{1,2})/(\d{4})\b"), lambda g: (int(g[2]), int(g[1]), int(g[0]))),  # dd/mm/yyyy
+    (re.compile(r"\b" + _MON + r"\s+(\d{1,2})" + _ORD + r",?\s+(\d{4})\b", re.IGNORECASE),
+     lambda g: (int(g[2]), _MONTHS[g[0][:3].lower()], int(g[1]))),
+    (re.compile(r"\b(\d{1,2})" + _ORD + r"\s+(?:of\s+)?" + _MON + r",?\s+(\d{4})\b", re.IGNORECASE),
+     lambda g: (int(g[2]), _MONTHS[g[1][:3].lower()], int(g[0]))),
+]
+
+
+def extract_date(text: str) -> str | None:
+    """First valid calendar date in the text as YYYY-MM-DD (standard library only).
+
+    Formats: 2026-02-26, 26/02/2026, Feb 26, 2026, February 26, 2026, 26 February 2026, 26 Feb 2026.
+    """
+    best: tuple[int, str] | None = None
+    for rx, parts in _DATE_PATTERNS:
+        for m in rx.finditer(text or ""):
+            if best is not None and m.start() >= best[0]:
+                break
+            try:
+                iso = date(*parts(m.groups())).isoformat()
+            except ValueError:
+                continue  # e.g. 31/02/2026: try the next match
+            best = (m.start(), iso)
+            break
+    return best[1] if best else None
 
 
 OFFICIAL_EVIDENCE = {EvidenceType.OFFICIAL_FINDING, EvidenceType.SETTLEMENT, EvidenceType.UNDER_APPEAL}
@@ -84,7 +119,7 @@ class EvidenceValidator:
             host = host[4:]
         return any(host == d or host.endswith("." + d) for d in self.regulator_domains)
 
-    def _classification_guards(self, data: dict, snap, warnings: list[str]) -> None:
+    def _classification_guards(self, data: dict, snap, warnings: list[str], source_text: str = "") -> None:
         """Deterministic corrections of the agent's evidence_type / event_date (mutates data)."""
         old = EvidenceType(data["evidence_type"])
         if old in OFFICIAL_EVIDENCE and snap.source_type != "regulatory_document" \
@@ -99,6 +134,16 @@ class EvidenceValidator:
         if not data.get("event_date") and snap.published_date:
             data["event_date"] = snap.published_date[:10]
             warnings.append("event_date taken from source publication date")
+        if not data.get("event_date"):
+            d = extract_date(data["supporting_passage"])
+            if d:
+                data["event_date"] = d
+                warnings.append("event_date extracted from passage")
+            else:
+                d = extract_date(source_text[:1500])
+                if d:
+                    data["event_date"] = d
+                    warnings.append("event_date extracted from source text")
 
     def _entity_mentioned(self, text_norm: str, entity: EntityResolution) -> bool:
         for name in entity.all_names:
@@ -126,7 +171,8 @@ class EvidenceValidator:
                 reasons.append("snapshot hash mismatch (content altered)")
             if _url_key(snap.source_url) != _url_key(f.source_url):
                 reasons.append("source_url does not match snapshot")
-            text_norm = normalize_text(self.snapshots.read_text(f.snapshot_id) or "")
+            source_text = self.snapshots.read_text(f.snapshot_id) or ""
+            text_norm = normalize_text(source_text)
             passage_norm = normalize_text(f.supporting_passage)
             if passage_norm and passage_norm in text_norm:
                 score = 100.0
@@ -143,7 +189,7 @@ class EvidenceValidator:
             missing = unsupported_figures(f"{f.title} {f.summary}", text_norm)
             if missing:
                 warnings.append("amounts in title/summary not found in source: " + ", ".join(missing))
-            self._classification_guards(data, snap, warnings)
+            self._classification_guards(data, snap, warnings, source_text)
 
         return ValidatedFinding(
             **data,
@@ -168,10 +214,10 @@ class EvidenceValidator:
                     continue  # exact duplicate (same agent, source, passage)
                 seen.add(vf.finding_id)
                 (verified if vf.verified else rejected).append(vf)
-        return self._dedupe_events(verified), rejected
+        return self._dedupe_events(verified, entity), rejected
 
     @staticmethod
-    def _dedupe_events(findings: list[ValidatedFinding]) -> list[ValidatedFinding]:
+    def _dedupe_events(findings: list[ValidatedFinding], entity: EntityResolution | None = None) -> list[ValidatedFinding]:
         """Same event reported several times: keep the strongest evidence once.
 
         A finding is merged into an already kept one if
@@ -180,12 +226,22 @@ class EvidenceValidator:
           - the dates match and the titles are near-identical, even across dimensions
             (a SEBI order and the news story about it must not be counted twice).
         Merged ids are recorded on the kept finding, never dropped silently.
+
+        Representative order: evidence type first, then findings whose title names the entity
+        (the company's own penalty represents an order, not an officer's), then severity.
         """
         rank = {"official_finding": 0, "under_appeal": 1, "settlement": 2, "media_confirmed": 3,
                 "media_allegation": 4, "unverified": 5}
         sev = {"critical": 0, "high": 1, "medium": 2, "low": 3}
         kept: list[ValidatedFinding] = []
-        for f in sorted(findings, key=lambda x: (rank[x.evidence_type.value], sev[x.severity.value])):
+        names = [n for n in (normalize_name(x).lower() for x in (entity.all_names if entity else [])) if n]
+
+        def names_entity(title: str) -> bool:
+            t = f" {normalize_name(title).lower()} "
+            return any(f" {n} " in t for n in names)
+
+        for f in sorted(findings, key=lambda x: (rank[x.evidence_type.value], not names_entity(x.title),
+                                                 sev[x.severity.value])):
             target = None
             for k in kept:
                 same_source = k.snapshot_id == f.snapshot_id and (

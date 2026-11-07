@@ -8,7 +8,8 @@ from crewai import LLM, Agent, Crew, Process, Task
 from crewai.tasks.task_output import TaskOutput
 
 from core.config import load_rules
-from core.schemas import Explanation, FindingsBatch
+from core.evidence_validator import EvidenceValidator
+from core.schemas import EntityResolution, EntityStatus, Explanation, FindingsBatch
 from orchestration.crewai_impl.tools import AdverseMediaSearchTool, ReadSourceTool, RegulatoryDocumentsTool
 
 EVIDENCE_RULES = """
@@ -33,23 +34,69 @@ def build_llm() -> LLM:
     return LLM(model=os.getenv("MODEL", "gpt-4o-mini"), temperature=float(os.getenv("MODEL_TEMPERATURE", "0")))
 
 
-def _findings_guardrail(output: TaskOutput):  # returns (bool, Any); CrewAI rejects string annotations
-    """Structural check only; semantic verification happens in core.evidence_validator."""
-    batch = output.pydantic
+def _structural_problem(batch) -> str | None:
     if not isinstance(batch, FindingsBatch):
-        return False, "Output must match the FindingsBatch schema."
+        return "Output must match the FindingsBatch schema."
     cfg = load_rules()["matching"]["validation"]
     for i, f in enumerate(batch.findings):
         if not f.snapshot_id or len(f.snapshot_id) != 16:
-            return False, f"finding {i}: snapshot_id must be the 16-character id returned by a tool."
+            return f"finding {i}: snapshot_id must be the 16-character id returned by a tool."
         n = len(f.supporting_passage.strip())
         if n < cfg["min_passage_chars"] or n > cfg["max_passage_chars"]:
-            return False, f"finding {i}: supporting_passage must be a verbatim quote of 20-600 characters (got {n})."
-    return True, batch
+            return f"finding {i}: supporting_passage must be a verbatim quote of 20-600 characters (got {n})."
+    return None
+
+
+# Validator failures the agent can fix by re-reading the source. Others (entity not mentioned, hash
+# mismatch) are left to the final validator in pipeline.finalize.
+_RETRYABLE = ("supporting_passage not found", "source_url does not match", "snapshot_id not found")
+GUARDRAIL_MAX_RETRIES = 2
+
+
+def make_findings_guardrail(inputs: dict | None = None, max_retries: int = GUARDRAIL_MAX_RETRIES):
+    """Task guardrail: structural checks, then the real evidence validator, with feedback to the agent.
+
+    After max_retries rejections the batch is accepted as is, so the task never errors out;
+    pipeline.finalize still rejects any claim that fails validation.
+    """
+    inputs = inputs or {}
+    aliases = [a.strip() for a in str(inputs.get("aliases", "")).split(",") if a.strip() and a.strip() != "none"]
+    vendor_name = inputs.get("vendor_name") or inputs.get("resolved_name") or "unknown"
+    entity = EntityResolution(
+        status=EntityStatus.USER_CONFIRMED, input_name=vendor_name,
+        resolved_name=inputs.get("resolved_name") or vendor_name, aliases=aliases, method="guardrail",
+    )
+    state = {"calls": 0}
+
+    def guardrail(output: TaskOutput):  # returns (bool, Any); CrewAI rejects string annotations
+        state["calls"] += 1
+        batch = output.pydantic
+        last_chance = state["calls"] > max_retries
+        problem = _structural_problem(batch)
+        if problem:
+            if last_chance:
+                return True, batch if isinstance(batch, FindingsBatch) else output.raw
+            return False, problem
+        if last_chance:
+            return True, batch
+        validator = EvidenceValidator()
+        failures = []
+        for i, f in enumerate(batch.findings):
+            reasons = [r for r in validator.validate_one(f, "guardrail", entity).rejection_reasons
+                       if r.startswith(_RETRYABLE)]
+            if reasons:
+                failures.append(f"- finding {i} '{f.title}': {'; '.join(reasons)}")
+        if failures:
+            return False, ("These findings could not be verified against the stored source:\n" + "\n".join(failures)
+                           + "\nCall read_source again and copy the passage VERBATIM from the text, "
+                             "or remove the finding.")
+        return True, batch
+
+    return guardrail
 
 
 # ---------------------------------------------------------------------------
-def regulatory_crew(llm: LLM) -> Crew:
+def regulatory_crew(llm: LLM, inputs: dict | None = None) -> Crew:
     agent = Agent(
         role="Regulatory Intelligence Analyst",
         goal="Extract and correctly classify regulatory actions against the vendor from curated official documents.",
@@ -73,12 +120,12 @@ def regulatory_crew(llm: LLM) -> Crew:
             + EVIDENCE_RULES
         ),
         expected_output="A FindingsBatch JSON object.",
-        agent=agent, output_pydantic=FindingsBatch, guardrail=_findings_guardrail, guardrail_max_retries=2,
+        agent=agent, output_pydantic=FindingsBatch, guardrail=make_findings_guardrail(inputs), guardrail_max_retries=GUARDRAIL_MAX_RETRIES,
     )
     return Crew(agents=[agent], tasks=[task], process=Process.sequential, verbose=False)
 
 
-def media_crew(llm: LLM) -> Crew:
+def media_crew(llm: LLM, inputs: dict | None = None) -> Crew:
     agent = Agent(
         role="Adverse Media Intelligence Analyst",
         goal="Find credible adverse media about the vendor and separate allegations from confirmed actions.",
@@ -99,7 +146,7 @@ def media_crew(llm: LLM) -> Crew:
             + EVIDENCE_RULES
         ),
         expected_output="A FindingsBatch JSON object.",
-        agent=agent, output_pydantic=FindingsBatch, guardrail=_findings_guardrail, guardrail_max_retries=2,
+        agent=agent, output_pydantic=FindingsBatch, guardrail=make_findings_guardrail(inputs), guardrail_max_retries=GUARDRAIL_MAX_RETRIES,
     )
     return Crew(agents=[agent], tasks=[task], process=Process.sequential, verbose=False)
 
@@ -131,7 +178,7 @@ def explainer_crew(llm: LLM) -> Crew:
     return Crew(agents=[agent], tasks=[task], process=Process.sequential, verbose=False)
 
 
-def single_agent_crew(llm: LLM) -> Crew:
+def single_agent_crew(llm: LLM, inputs: dict | None = None) -> Crew:
     """Baseline: ONE agent with every tool does both regulatory and media research."""
     agent = Agent(
         role="Vendor Due Diligence Analyst",
@@ -148,6 +195,6 @@ def single_agent_crew(llm: LLM) -> Crew:
             + EVIDENCE_RULES
         ),
         expected_output="A FindingsBatch JSON object.",
-        agent=agent, output_pydantic=FindingsBatch, guardrail=_findings_guardrail, guardrail_max_retries=2,
+        agent=agent, output_pydantic=FindingsBatch, guardrail=make_findings_guardrail(inputs), guardrail_max_retries=GUARDRAIL_MAX_RETRIES,
     )
     return Crew(agents=[agent], tasks=[task], process=Process.sequential, verbose=False)
