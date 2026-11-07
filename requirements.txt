@@ -1,0 +1,12 @@
+# Tested together on Python 3.13 (CrewAI requires >=3.10,<3.14)
+crewai==1.15.35
+pydantic==2.12.5
+httpx==0.28.1
+rapidfuzz==3.14.6
+PyYAML==6.0.3
+tavily-python==0.8.5
+pypdf==6.17.0
+python-dotenv==1.2.3
+streamlit==1.66.1
+pandas==3.0.5
+pytest==9.1.1

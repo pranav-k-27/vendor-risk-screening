@@ -1,0 +1,59 @@
+# Deterministic rules. The LLM never reads or changes these numbers.
+# Weights are design assumptions for a portfolio MVP, NOT an industry standard.
+# Change them here, bump `version`, and re-run eval to see the effect.
+version: "2026.11-mvp1"
+
+scoring:
+  severity_points:          # base points for a single finding
+    low: 8
+    medium: 20
+    high: 40
+    critical: 70
+
+  evidence_multiplier:      # how much a finding counts, by evidence quality
+    official_finding: 1.0
+    settlement: 0.7
+    under_appeal: 0.6
+    media_confirmed: 0.8
+    media_allegation: 0.35
+    unverified: 0.0         # recorded for the reviewer, never scored
+
+  dimension_caps:           # one noisy dimension cannot dominate
+    regulatory: 60
+    adverse_media: 40
+
+  recency:                  # older events count less, never zero
+    full_weight_years: 3
+    decay_per_year: 0.15
+    floor: 0.3
+    undated_multiplier: 0.7
+
+  bands:                    # inclusive upper bounds
+    LOW: 19.99
+    MEDIUM: 44.99
+    HIGH: 69.99
+    CRITICAL: 100
+
+  sanctions_strong_hit_score: 100   # hard stop
+
+confidence:
+  # share of scored points coming from official (regulator) evidence
+  official_share_high: 0.6
+  # minimum entity-resolution confidence for HIGH overall confidence
+  entity_confidence_high: 0.9
+  # completeness below this => INSUFFICIENT when nothing was found
+  min_completeness: 0.99
+
+matching:
+  sanctions:
+    strong_threshold: 95        # token_sort_ratio on normalised names
+    potential_threshold: 88
+    short_name_min_tokens: 2    # 1-token names need an exact normalised match
+  entity:
+    auto_accept_score: 92
+    auto_accept_margin: 5       # gap to the runner-up candidate
+  validation:
+    passage_min_score: 90       # rapidfuzz partial_ratio, passage vs snapshot text
+    entity_min_score: 85
+    min_passage_chars: 20
+    max_passage_chars: 600

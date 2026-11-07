@@ -1,0 +1,13 @@
+.env
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+# runtime data (keep curated documents, synthetic list and the gold standard)
+data/snapshots/
+data/runs/
+data/audit/
+data/cache/
+data/sanctions/ofac_*.csv
+data/sanctions/un_consolidated.xml
+eval/results/*.json
