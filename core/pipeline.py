@@ -21,6 +21,7 @@ from core.reporting import save_report
 from core.risk_engine import score as score_risk
 from core.sanctions_matcher import SanctionsMatcher
 from core.schemas import (
+    AgentMetrics,
     AssessmentReport,
     EntityResolution,
     EntityStatus,
@@ -157,6 +158,7 @@ def finalize(
 ) -> AssessmentReport:
     errors = list(errors or [])
     usage_total: dict[str, int] = {}
+    per_agent: dict[str, AgentMetrics] = {}
 
     source_status = {"sanctions": sanctions_status}
     batches = {}
@@ -166,8 +168,7 @@ def finalize(
             errors.append(f"{o.agent}: {o.error}")
         if o.batch:
             batches[o.agent] = o.batch.findings
-        for k, v in (o.usage or {}).items():
-            usage_total[k] = usage_total.get(k, 0) + int(v or 0)
+        _add_usage(usage_total, per_agent, (o.usage or {}).get("agent") or o.agent, o.usage)
 
     if validate:
         verified, rejected = svc.validator.validate(batches, entity)
@@ -198,8 +199,7 @@ def finalize(
             explanation, usage = explain(explainer_context(report))
             report.explanation = explanation
             report.explanation_check = check_explanation(explanation, assessment, verified)
-            for k, v in (usage or {}).items():
-                usage_total[k] = usage_total.get(k, 0) + int(v or 0)
+            _add_usage(usage_total, per_agent, "explainer", usage)
             if not report.explanation_check.consistent:
                 assessment.review_flags.append("EXPLANATION_INCONSISTENT")
         except Exception as exc:
@@ -211,6 +211,7 @@ def finalize(
         completion_tokens=usage_total.get("completion_tokens", 0),
         total_tokens=usage_total.get("total_tokens", 0),
         successful_requests=usage_total.get("successful_requests", 0),
+        per_agent=per_agent,
     )
     save_report(report)
     svc.audit.log(run_id, "report_ready_for_review", {"status": report.status.value, "errors": report.errors})
@@ -228,6 +229,23 @@ def halt_for_entity(
     save_report(report)
     svc.audit.log(run_id, "halted_for_entity_confirmation", {"candidates": [c.model_dump() for c in entity.candidates]})
     return report
+
+
+_TOKEN_KEYS = ("prompt_tokens", "completion_tokens", "total_tokens", "successful_requests")
+
+
+def _add_usage(total: dict[str, int], per_agent: dict, agent: str, usage: dict | None) -> None:
+    """Add one agent's usage to the run total and to its per-agent entry. Only numeric token
+    fields are summed; 'tool_calls' (name -> count) is merged per agent; 'agent' is a label."""
+    if not usage:
+        return
+    m = per_agent.setdefault(agent, AgentMetrics())
+    for k in _TOKEN_KEYS:
+        v = int(usage.get(k) or 0)
+        total[k] = total.get(k, 0) + v
+        setattr(m, k, getattr(m, k) + v)
+    for name, n in (usage.get("tool_calls") or {}).items():
+        m.tool_calls[name] = m.tool_calls.get(name, 0) + int(n or 0)
 
 
 def usage_from(obj) -> dict:

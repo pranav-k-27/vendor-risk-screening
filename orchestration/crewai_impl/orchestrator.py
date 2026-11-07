@@ -15,13 +15,20 @@ from core.pipeline import ResearchOutcome, Services
 from core.schemas import AssessmentReport, Explanation, FindingsBatch, SourceStatus, VendorInput
 from orchestration.crewai_impl import agents
 from orchestration.crewai_impl.flow import Runners, VendorAssessmentFlow
+from orchestration.crewai_impl.tools import ToolCallCounter
 
 
-def _crew_runner(build):
+def _crew_runner(build, agent_label: str | None = None):
+    """build(inputs, tool_calls) -> Crew. Usage returned includes per-tool call counts ('tool_calls')
+    and, if given, an 'agent' label used for per-agent metrics."""
     async def run(inputs: dict) -> tuple[FindingsBatch, dict]:
-        out = await build(inputs).kickoff_async(inputs=inputs)  # guardrail needs the run inputs
+        calls = ToolCallCounter()
+        out = await build(inputs, calls).kickoff_async(inputs=inputs)  # guardrail needs the run inputs
         batch = out.pydantic if isinstance(out.pydantic, FindingsBatch) else FindingsBatch()
-        return batch, pipeline.usage_from(out)
+        usage = pipeline.usage_from(out) | {"tool_calls": dict(calls.counts)}
+        if agent_label:
+            usage["agent"] = agent_label
+        return batch, usage
     return run
 
 
@@ -38,8 +45,8 @@ def default_runners(explain: bool = True, guard_validate: bool = True) -> Runner
     """guard_validate=False: task guardrails run structural checks only (no validator feedback loop)."""
     llm = agents.build_llm()
     return Runners(
-        regulatory=_crew_runner(lambda inputs: agents.regulatory_crew(llm, inputs, guard_validate)),
-        media=_crew_runner(lambda inputs: agents.media_crew(llm, inputs, guard_validate)),
+        regulatory=_crew_runner(lambda inputs, calls: agents.regulatory_crew(llm, inputs, guard_validate, calls)),
+        media=_crew_runner(lambda inputs, calls: agents.media_crew(llm, inputs, guard_validate, calls)),
         explain=_explain_runner(llm) if explain else None,
     )
 
@@ -73,7 +80,8 @@ class SingleAgentOrchestrator:
         self.svc = svc or Services.default()
         self.validate = validate
         llm = agents.build_llm() if (research is None or (explain and explain_fn is None)) else None
-        self.research = research or _crew_runner(lambda inputs: agents.single_agent_crew(llm, inputs))
+        self.research = research or _crew_runner(
+            lambda inputs, calls: agents.single_agent_crew(llm, inputs, tool_calls=calls), agent_label="single_agent")
         self.explain = explain_fn or (_explain_runner(llm) if explain else None)
         self.model = os.getenv("MODEL", "gpt-4o-mini")
 

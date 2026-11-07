@@ -264,12 +264,23 @@ class ReviewDecision(BaseModel):
     reviewed_report_sha256: str
 
 
+class AgentMetrics(BaseModel):
+    """Cost of one agent (crew) within a run, so totals can be attributed."""
+
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+    successful_requests: int = 0
+    tool_calls: dict[str, int] = Field(default_factory=dict, description="executions per tool name")
+
+
 class RunMetrics(BaseModel):
     duration_s: float = 0.0
     prompt_tokens: int = 0
     completion_tokens: int = 0
     total_tokens: int = 0
     successful_requests: int = 0
+    per_agent: dict[str, AgentMetrics] = Field(default_factory=dict, description="e.g. regulatory, adverse_media, explainer")
 
 
 class AssessmentReport(BaseModel):

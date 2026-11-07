@@ -11,7 +11,9 @@ from core.audit import AuditLogger
 from core.config import load_rules
 from core.evidence_validator import EvidenceValidator
 from core.schemas import EntityResolution, EntityStatus, Explanation, FindingsBatch
-from orchestration.crewai_impl.tools import AdverseMediaSearchTool, ReadSourceTool, RegulatoryDocumentsTool
+from orchestration.crewai_impl.tools import (
+    AdverseMediaSearchTool, ReadSourceTool, RegulatoryDocumentsTool, SearchSourceTool, ToolCallCounter,
+)
 
 EVIDENCE_RULES = """
 EVIDENCE RULES (mandatory):
@@ -125,7 +127,8 @@ def make_findings_guardrail(inputs: dict | None = None, max_retries: int | None 
 
 
 # ---------------------------------------------------------------------------
-def regulatory_crew(llm: LLM, inputs: dict | None = None, guard_validate: bool = True) -> Crew:
+def regulatory_crew(llm: LLM, inputs: dict | None = None, guard_validate: bool = True,
+                tool_calls: ToolCallCounter | None = None) -> Crew:
     agent = Agent(
         role="Regulatory Intelligence Analyst",
         goal="Extract and correctly classify regulatory actions against the vendor from curated official documents.",
@@ -133,14 +136,16 @@ def regulatory_crew(llm: LLM, inputs: dict | None = None, guard_validate: bool =
             "You are a compliance analyst who reads SEBI and other regulator orders. You distinguish final "
             "penalties from settlements, appeals and show-cause notices, and you never guess."
         ),
-        tools=[RegulatoryDocumentsTool(), ReadSourceTool()],
+        tools=[RegulatoryDocumentsTool(call_counter=tool_calls), SearchSourceTool(call_counter=tool_calls),
+               ReadSourceTool(call_counter=tool_calls)],
         llm=llm, allow_delegation=False, max_iter=15, verbose=False,
     )
     task = Task(
         description=(
             "Vendor: {vendor_name} (resolved legal name: {resolved_name}; other names: {aliases}).\n"
             "1. Call list_regulatory_documents with company_name='{vendor_name}'.\n"
-            "2. Read every document fully with read_source (continue while 'more' is true).\n"
+            "2. Use search_source with queries like 'penalty imposed', 'hereby order', 'directions', the company "
+            "name, and read_source only around the offsets it returns. Do not read whole documents.\n"
             "3. Output exactly ONE finding per regulatory action against THIS entity (one order = one finding), "
             "with dimension='regulatory'. Penalties on directors, officers or employees named in the same order "
             "go in that finding's summary, not in separate findings. Write every amount in the title and summary "
@@ -155,7 +160,8 @@ def regulatory_crew(llm: LLM, inputs: dict | None = None, guard_validate: bool =
     return Crew(agents=[agent], tasks=[task], process=Process.sequential, verbose=False)
 
 
-def media_crew(llm: LLM, inputs: dict | None = None, guard_validate: bool = True) -> Crew:
+def media_crew(llm: LLM, inputs: dict | None = None, guard_validate: bool = True,
+                tool_calls: ToolCallCounter | None = None) -> Crew:
     agent = Agent(
         role="Adverse Media Intelligence Analyst",
         goal="Find credible adverse media about the vendor and separate allegations from confirmed actions.",
@@ -163,7 +169,7 @@ def media_crew(llm: LLM, inputs: dict | None = None, guard_validate: bool = True
             "You are an investigative researcher for a procurement risk team. You prefer reputable outlets, "
             "check that the article is about the right company, and treat allegations as allegations."
         ),
-        tools=[AdverseMediaSearchTool(), ReadSourceTool()],
+        tools=[AdverseMediaSearchTool(call_counter=tool_calls), ReadSourceTool(call_counter=tool_calls)],
         llm=llm, allow_delegation=False, max_iter=20, verbose=False,
     )
     task = Task(
@@ -209,13 +215,15 @@ def explainer_crew(llm: LLM) -> Crew:
     return Crew(agents=[agent], tasks=[task], process=Process.sequential, verbose=False)
 
 
-def single_agent_crew(llm: LLM, inputs: dict | None = None, guard_validate: bool = True) -> Crew:
+def single_agent_crew(llm: LLM, inputs: dict | None = None, guard_validate: bool = True,
+                tool_calls: ToolCallCounter | None = None) -> Crew:
     """Baseline: ONE agent with every tool does both regulatory and media research."""
     agent = Agent(
         role="Vendor Due Diligence Analyst",
         goal="Find regulatory actions and adverse media about the vendor.",
         backstory="You are a generalist due diligence analyst.",
-        tools=[RegulatoryDocumentsTool(), AdverseMediaSearchTool(), ReadSourceTool()],
+        tools=[RegulatoryDocumentsTool(call_counter=tool_calls), AdverseMediaSearchTool(call_counter=tool_calls),
+               ReadSourceTool(call_counter=tool_calls)],
         llm=llm, allow_delegation=False, max_iter=30, verbose=False,
     )
     task = Task(

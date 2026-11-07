@@ -131,6 +131,91 @@ def list_documents(company_name: str, snapshots: SnapshotManager | None = None, 
     return out
 
 
+SEARCH_WINDOW = 1500
+SEARCH_OVERLAP = 300
+_WORD = re.compile(r"[a-z0-9]+(?:[-.,][a-z0-9]+)*")
+_STOPWORDS = {
+    "a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "has", "in", "is", "it", "of", "on", "or",
+    "that", "the", "this", "to", "was", "were", "with", "ltd", "limited",
+}
+
+
+def _stem(t: str) -> str:
+    """Crude suffix stripping so word variants match: penalties/penalty, imposed/impose, orders/order."""
+    if t.isdigit() or len(t) <= 4:
+        return t
+    if t.endswith("ies"):
+        return t[:-3] + "y"
+    for suf in ("ing", "ed", "es", "s", "e"):
+        if t.endswith(suf) and len(t) - len(suf) >= 3:
+            return t[: -len(suf)]
+    return t
+
+
+def _terms(text: str) -> list[str]:
+    return [_stem(t) for t in _WORD.findall(text.lower()) if t not in _STOPWORDS]
+
+
+def _windows(text: str, size: int = SEARCH_WINDOW, overlap: int = SEARCH_OVERLAP) -> list[tuple[int, int]]:
+    if not text:
+        return []
+    step = max(1, size - overlap)
+    out, start = [], 0
+    while True:
+        end = min(len(text), start + size)
+        out.append((start, end))
+        if end >= len(text):
+            return out
+        start += step
+
+
+def _window_score(window: str, q_terms: list[str], phrase: str) -> float:
+    """Keyword overlap: distinct query terms present count most; repeats add a little (capped);
+    the whole query appearing as a phrase gets a bonus."""
+    counts: dict[str, int] = {}
+    for t in _terms(window):
+        counts[t] = counts.get(t, 0) + 1
+    distinct = [t for t in set(q_terms) if counts.get(t)]
+    if not distinct:
+        return 0.0
+    score = 2.0 * len(distinct) + sum(min(counts[t], 3) for t in distinct) * 0.5
+    if phrase and len(q_terms) > 1 and phrase in " ".join(window.lower().split()):
+        score += 2.0 * len(set(q_terms))
+    return score
+
+
+def search_source(snapshot_id: str, query: str, top_k: int = 5, snapshots: SnapshotManager | None = None) -> dict:
+    """Return the top_k ~1500-char windows of a snapshot that best match the query (keyword overlap,
+    case-insensitive, standard library only), with their char offsets, wrapped as untrusted content.
+    Use read_source(start=<start>) to read more around a hit."""
+    snapshots = snapshots or SnapshotManager()
+    snap = snapshots.get(snapshot_id)
+    if snap is None:
+        raise SourceError(f"unknown snapshot_id {snapshot_id}")
+    text = snapshots.read_text(snapshot_id) or ""
+    q_terms = _terms(query)
+    phrase = " ".join(query.lower().split())
+    scored = []
+    for start, end in _windows(text):
+        s = _window_score(text[start:end], q_terms, phrase)
+        if s > 0:
+            scored.append((s, start, end))
+    scored.sort(key=lambda x: (-x[0], x[1]))  # best first; ties: earlier in the document
+    results = [
+        {"start": start, "end": end, "score": round(s, 2), "content": wrap_untrusted(snapshot_id, text[start:end])}
+        for s, start, end in scored[: max(1, int(top_k))]
+    ]
+    return {
+        "snapshot_id": snapshot_id,
+        "url": snap.source_url,
+        "title": snap.title,
+        "query": query,
+        "total_chars": len(text),
+        "windows_searched": len(_windows(text)),
+        "results": results,
+    }
+
+
 def read_snapshot(snapshot_id: str, start: int = 0, max_chars: int = 12000, snapshots: SnapshotManager | None = None) -> dict:
     snapshots = snapshots or SnapshotManager()
     snap = snapshots.get(snapshot_id)
